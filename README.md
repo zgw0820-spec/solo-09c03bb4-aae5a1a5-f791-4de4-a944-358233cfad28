@@ -1,7 +1,12 @@
 # image-digest-admission
 
-Kubernetes mutating admission webhook (FastAPI) that rewrites mutable image
-**tags** into OCI **index digests** on Deployment create/update.
+两个协同能力，共用同一个本地 OCI 仓库与 FastAPI 进程：
+
+1. **Mutating admission webhook**：Deployment create/update 时把可变镜像
+   **标签**改写成 OCI **索引摘要**（`/mutate`，行为保持不变）。
+2. **多架构合版 API（合版）**：linux/amd64 与 linux/arm64 两路 CI 各自构建并
+   推送子清单到同一本地仓库后，按构建批次登记回报、核对平台，并在两路有效
+   回报收齐时写入一份 OCI 多架构索引，返回可直接拉取的摘要引用。
 
 ## 为什么需要它
 
@@ -33,20 +38,140 @@ Kubernetes mutating admission webhook (FastAPI) that rewrites mutable image
 
 ```
 app/
-  main.py                 FastAPI 入口：POST /mutate、GET /healthz
-  admission/
-    config.py             环境变量配置
-    images.py             镜像引用解析
-    registry.py           OCI Distribution API 客户端 + 平台核对
-    policy.py             架构选择、请求内缓存、JSON Patch 生成
+  main.py                 FastAPI 入口：POST /mutate、合版 API、GET /healthz
+  admission/              准入 webhook（引用解析、平台核对、JSON Patch）
+  merger/                 合版功能（纯标准库，可离线单测）
+    models.py             入参校验、平台/回报领域模型
+    store.py              单进程内线程安全状态：尝试号优胜、冲突规则
+    registry_gateway.py   OCI Distribution 客户端：拉子清单/配置 blob、推索引
+    service.py            登记校验与发布编排（锁拆分、冲突回退）
 scripts/
-  seed_registry.py        纯标准库：向本地仓库推送 OCI 测试夹具
+  seed_registry.py        纯标准库：向本地仓库推送 OCI 准入测试夹具
   send_admission.py       纯标准库：发送 AdmissionReview 并解码补丁
-samples/                  6 个可直接提交的 AdmissionReview 请求
-tests/                    34 个离线测试（unittest，仅依赖标准库）
+  ci_build_report.py      模拟单平台 CI：构建推送子清单 + 发送回报
+  publish_batch.py        触发合版 / 查询批次状态
+samples/
+  deployment-*.json       6 个 AdmissionReview 请求
+  merge/                  合版 API 的 curl 样例请求
+tests/                    68 个离线测试（unittest，仅依赖标准库）
 docker-compose.yml        webhook + 本地 registry
 Dockerfile                webhook 镜像
 ```
+
+## 合版 API（多架构批次合并）
+
+### 数据流与规则
+
+1. 两路 CI（`linux/amd64`、`linux/arm64`）各自构建镜像，把子清单（child
+   manifest）按摘要推到**同一本地仓库**。
+2. 每路 CI 调用 `POST /api/v1/reports` 回报：仓库路径、构建批次、平台、
+   尝试号（attempt，≥1）、子清单摘要。
+3. 服务端**登记前**用回报摘要拉取子清单，再拉它的 **config blob**，核对其中
+   的 `os` / `architecture` 与回报平台一致；核对不过（含子清单或配置 blob
+   不存在、媒体类型不对、平台不符）直接 422，回报不入库。
+4. 同批次同平台只保留**尝试号最大的有效回报**：
+   - 更大尝试号覆盖旧值；更旧的迟到回报返回 `superseded` 且不改状态；
+   - 同尝试号同摘要返回 `duplicate`；
+   - **同尝试号不同摘要返回 409 冲突**，已登记内容保持不变。
+5. 发布员调用 `POST /api/v1/publish` 指定仓库路径与批次：两路有效回报都
+   收齐后，按回报摘要构建并写入 OCI 索引（不改任何标签），返回
+   `localhost:5000/<repo>@sha256:<index>` 形式的可拉取引用。
+6. 写索引期间照常接收回报（registry I/O 不持状态锁）。提交发布结果前再做
+   一次原子校验：若本批任一路有更高尝试号回报（或基准摘要变化）在登记后
+   生效，本次发布返回 **409 冲突**、已写索引不作为发布结果。
+7. 发布失败或冲突时，响应里返回**上次成功的引用** `last_good_reference`
+   （首次发布尚无成功记录时为 `null`）；按最新回报重试即可重新合版。
+8. 状态只保存在单进程内存中，重启即清空；不创建、不修改、不删除任何标签。
+
+### 接口一览
+
+| 方法与路径 | 说明 | 主要状态码 |
+| --- | --- | --- |
+| `POST /api/v1/reports` | 登记一路平台回报（先核对 config blob 平台） | 200 / 409 / 422 / 502 |
+| `POST /api/v1/publish` | 按批次合版并写 OCI 索引 | 200 / 409 / 422 / 502 |
+| `GET /api/v1/batches?repository=&batch=` | 查询批次内存状态与上次成功引用 | 200 / 422 |
+| `POST /mutate` | 原有准入改写（保持不变） | 200 |
+| `GET /healthz` | 健康检查 | 200 |
+
+回报请求体：
+
+```json
+{
+  "repository": "apps/merged",
+  "batch": "b-2026-1",
+  "platform": "linux/amd64",
+  "attempt": 1,
+  "digest": "sha256:..."
+}
+```
+
+发布响应（成功）：
+
+```json
+{
+  "status": "published",
+  "repository": "apps/merged",
+  "batch": "b-2026-1",
+  "reference": "localhost:5000/apps/merged@sha256:9f2c...",
+  "index_digest": "sha256:9f2c...",
+  "last_good_reference": "localhost:5000/apps/merged@sha256:9f2c...",
+  "reason": null,
+  "reports": { "linux/amd64": {...}, "linux/arm64": {...} }
+}
+```
+
+冲突/失败时 HTTP 状态为 409/502，业务字段放在 `detail` 内，
+`last_good_reference` 给出仍可拉取的上一版引用。
+
+### 用 Docker Compose 试跑合版
+
+```bash
+docker compose up -d --build
+
+# 1. 两路 CI 各自构建、推送子清单并回报（脚本会把摘要 POST 给合版 API）
+python3 scripts/ci_build_report.py --repository apps/merged \
+    --batch b-2026-1 --platform linux/amd64 --attempt 1
+python3 scripts/ci_build_report.py --repository apps/merged \
+    --batch b-2026-1 --platform linux/arm64 --attempt 1
+
+# 2. 查询批次状态（应看到两路 attempt=1 的有效回报）
+python3 scripts/publish_batch.py --repository apps/merged \
+    --batch b-2026-1 --status
+
+# 3. 合版，拿到可拉取引用
+python3 scripts/publish_batch.py --repository apps/merged --batch b-2026-1
+# -> docker pull localhost:5000/apps/merged@sha256:...
+
+# 4. 模拟重试：amd64 以更大尝试号重新构建回报，再次发布生成新索引
+python3 scripts/ci_build_report.py --repository apps/merged \
+    --batch b-2026-1 --platform linux/amd64 --attempt 2
+python3 scripts/publish_batch.py --repository apps/merged --batch b-2026-1
+```
+
+也可以直接用 curl 与 `samples/merge/` 下的样例（注意样例里的摘要需替换成
+仓库中真实存在的子清单摘要，否则登记期核对会返回 422）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/reports \
+    -H 'Content-Type: application/json' \
+    --data @samples/merge/report-amd64-1.json
+curl -s -X POST http://localhost:8080/api/v1/publish \
+    -H 'Content-Type: application/json' \
+    --data @samples/merge/publish.json
+# 同尝试号不同摘要 -> 409：
+curl -s -X POST http://localhost:8080/api/v1/reports \
+    -H 'Content-Type: application/json' \
+    --data @samples/merge/report-amd64-1-conflict.json
+```
+
+### 并发与一致性说明
+
+- 状态存储 `MergeStore` 用单把可重入锁保护；registry 的 HTTP 往返（核对、
+  写索引）在锁外执行，因此写索引期间回报接口不被阻塞。
+- 发布基于进入时的回报快照（basis）；写完索引重新拿锁提交，任一路出现更高
+  尝试号或基准摘要变化即整体判冲突，不更新“上次成功引用”。
+- 进程重启后内存状态丢失，但已经推送进 registry 的索引与子清单仍然存在；
+- 标签从不被本服务修改，合版产物只能通过摘要引用拉取。
 
 ## 用 Docker Compose 启动
 
@@ -132,6 +257,7 @@ python3 scripts/send_admission.py samples/deployment-non-local-registry.json
 | --- | --- | --- |
 | `ALLOWED_REGISTRIES` | `localhost:5000,registry:5000` | 允许解析的本地 registry host 列表，逗号分隔 |
 | `REGISTRY_UPSTREAM` | `http://registry:5000` | webhook 访问仓库用的地址（可与 workload 里的 host 不同） |
+| `PUBLIC_REGISTRY_HOST` | `localhost:5000` | 合版 API 返回的可拉取引用使用的 host |
 | `REGISTRY_TIMEOUT` | `5` | 单次仓库 HTTP 请求超时（秒） |
 
 注意：补丁里保留镜像原始 host（如 `localhost:5000`），只把标签换成
@@ -143,8 +269,11 @@ python3 scripts/send_admission.py samples/deployment-non-local-registry.json
 
 ```bash
 python3 -I tests/run.py
-# 34 tests OK：引用解析、平台选择、索引解析、请求内只解析一次、
-# 标签改指重新查询、缺平台/缺子清单/摘要不一致拒绝、真实 HTTP 端到端
+# 68 tests OK：引用解析、平台选择、索引解析、请求内只解析一次、
+# 标签改指重新查询、缺平台/缺子清单/摘要不一致拒绝、真实 HTTP 端到端；
+# 合版：入参校验、尝试号优胜/同号冲突/迟到回报、config blob 平台核对、
+# 未收齐拒发、写索引期间换报冲突与回退、失败返回上次成功引用、重试合版、
+# 合版全链路真实 HTTP 端到端
 ```
 
 `tests/test_http_e2e.py` 会在本机临时端口起一个实现了 Distribution v2
@@ -163,3 +292,8 @@ python3 -I tests/run.py
 - 仓库查询失败目前快速失败拒绝请求，没有重试；高并发下的限流/熔断未实现。
 - Compose 面向演示；未提供在真实集群安装 webhook 所需的
   Service / MutatingWebhookConfiguration 清单。
+- 合版状态仅保存在单进程内存：多副本部署不会共享回报状态，进程重启后
+  “上次成功引用”与待发布回报丢失（registry 中的索引/子清单不受影响）；
+  生产化需要外接存储或改为单实例 + 持久化。
+- 合版只支持固定的 `linux/amd64` 与 `linux/arm64` 两路，且不接受嵌套索引；
+  回报没有鉴权与签名校验，依赖本地可信网络。

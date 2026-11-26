@@ -28,6 +28,9 @@ class Settings:
     )
     # Host used when talking to the registry from inside the webhook pod.
     registry_upstream: str = os.getenv("REGISTRY_UPSTREAM", "http://registry:5000")
+    # Host rendered into pullable references returned by the merge/publish
+    # API (the address workloads use, as opposed to the in-pod upstream).
+    public_registry_host: str = os.getenv("PUBLIC_REGISTRY_HOST", "localhost:5000")
     # Platforms checked when the pod template does not pin an architecture.
     default_platforms: tuple[str, ...] = ("linux/amd64", "linux/arm64")
     request_timeout: float = float(os.getenv("REGISTRY_TIMEOUT", "5"))

@@ -1,0 +1,7 @@
+{
+  "repository": "apps/merged",
+  "batch": "b-2026-1",
+  "platform": "linux/amd64",
+  "attempt": 1,
+  "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}

@@ -23,6 +23,8 @@ services:
     environment:
       ALLOWED_REGISTRIES: "localhost:5000,registry:5000"
       REGISTRY_UPSTREAM: "http://registry:5000"
+      # Host rendered into the pullable references returned by the merge API.
+      PUBLIC_REGISTRY_HOST: "localhost:5000"
       REGISTRY_TIMEOUT: "5"
     depends_on:
       registry:
