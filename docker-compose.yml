@@ -1,0 +1,34 @@
+services:
+  registry:
+    image: registry:2
+    container_name: local-oci-registry
+    ports:
+      # Exposed on the host so `docker push` and the demo scripts can use
+      # localhost:5000; inside the Compose network the webhook uses the
+      # service name registry:5000.
+      - "127.0.0.1:5000:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:5000/v2/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  webhook:
+    build: .
+    container_name: image-digest-webhook
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ALLOWED_REGISTRIES: "localhost:5000,registry:5000"
+      REGISTRY_UPSTREAM: "http://registry:5000"
+      REGISTRY_TIMEOUT: "5"
+    depends_on:
+      registry:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
